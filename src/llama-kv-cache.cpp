@@ -182,7 +182,10 @@ llama_kv_cache::llama_kv_cache(
         if (it == ctx_map.end()) {
             ggml_init_params params = {
                 // +3 for turbo rotation matrices (turbo_rotation + turbo_rotation_inv + turbo_innerq_scale_inv)
-                /*.mem_size   =*/ size_t((3u*(1 + n_stream)*n_layer + 3)*ggml_tensor_overhead()), // Reserve tensor metadata for up to 3 tensors per layer (K, V, and optional K_idx), plus one view per tensor per stream, plus 3 global turbo tensors.
+                // Size this for the actual layer loop below. Some models expose extra
+                // KV-bearing layers through n_layer_all, and under-reserving tensor
+                // metadata corrupts later KV/checkpoint operations.
+                /*.mem_size   =*/ size_t((3u*(1 + n_stream)*n_layer + 3)*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -265,6 +268,11 @@ llama_kv_cache::llama_kv_cache(
             n_embd_head_k_all = -1;
         }
 
+        // MLA caches V in latent (compressed) form — n_embd_head_v is not the
+        // head dimension of the stored values, so V-head-dim tracking and the
+        // LLAMA_ATTN_ROT_V_OVERRIDE V-rotation path (which depends on
+        // n_embd_head_v_all) are intentionally skipped. V-rotation on MLA latent
+        // KV is numerically invalid.
         if (!is_mla) {
             if (n_embd_head_v_all == 0) {
                 n_embd_head_v_all = (int32_t) hparams.n_embd_head_v(il);
@@ -593,15 +601,12 @@ llama_kv_cache::llama_kv_cache(
                 hparams.n_embd_head_v() % 64 == 0;
         }
 
-        attn_rot_k =
-            !attn_rot_disable &&
-            n_embd_head_k_all > 0 &&
-            ggml_is_quantized(type_k) &&
-            hparams.n_embd_head_k() % 64 == 0;
-
-        // always create Hadamard rotation tensors for DeepSeek lightning indexers
-        if ((model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_GLM_DSA) &&
-                hparams.n_embd_head_k_full == hparams.indexer_head_size) {
+        // always create Hadamard rotation tensors for DeepSeek V3.2 DSA lightning
+        // indexer: this is a functional requirement for the model, not optional
+        // tuning, so it overrides the default-off policy (still respects the hard
+        // LLAMA_ATTN_ROT_DISABLE lock-out).
+        if (!attn_rot_disable && (model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4) &&
+            hparams.n_embd_head_k_full == hparams.indexer_head_size) {
             attn_rot_k = true;
         }
     }
@@ -2251,6 +2256,11 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch 
 }
 
 void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
+    if (!dst) {
+        // rotation disabled for this cache (attn_rot_k == false): the graph
+        // never created the input tensor — nothing to fill.
+        return;
+    }
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
     const auto n_rot = dst->ne[0];
@@ -3173,6 +3183,10 @@ ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) cons
     return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
 }
 
+ggml_tensor * llama_kv_cache_context::get_k_idx(ggml_context * ctx, int32_t il) const {
+    return kv->get_k_idx(ctx, il, n_kv, sinfos[i_cur]);
+}
+
 ggml_tensor * llama_kv_cache_context::get_turbo_rotation() const {
     return kv->get_turbo_rotation();
 }
@@ -3191,10 +3205,6 @@ ggml_tensor * llama_kv_cache_context::get_turbo_rot_inverse() const {
 
 ggml_tensor * llama_kv_cache_context::get_turbo_innerq_scale_inv() const {
     return kv->get_turbo_innerq_scale_inv();
-}
-
-ggml_tensor * llama_kv_cache_context::get_k_idx(ggml_context * ctx, int32_t il) const {
-    return kv->get_k_idx(ctx, il, n_kv, sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {

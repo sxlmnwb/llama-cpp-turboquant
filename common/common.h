@@ -294,10 +294,6 @@ struct common_params_sampling {
 
     bool backend_sampling = false;
 
-    bool has_logit_bias() const {
-        return !logit_bias.empty();
-    }
-
     // print the parameters into a string
     std::string print() const;
 };
@@ -351,9 +347,10 @@ struct common_params_speculative_draft {
 
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
 
-    bool    eagle3       = false; // use EAGLE3 speculative decoding
-    bool    dflash       = false; // use DFlash speculative decoding
-    int32_t n_ctx        = 0;  // draft context size
+    bool    eagle3                = false; // use EAGLE3 speculative decoding
+    bool    dflash                = false; // use DFlash speculative decoding
+    bool    dflash_defer_injection = true;  // defer encoder KV injection to draft time (set false for higher acceptance on some models)
+    int32_t n_ctx                 = 0;     // draft context size
 
 };
 
@@ -941,6 +938,9 @@ void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adap
 // model endpoint from env
 std::string common_get_model_endpoint();
 
+// for testing purposes
+char * common_get_model_or_exit(int, char*[]);
+
 //
 // Context utils
 //
@@ -956,10 +956,17 @@ enum common_context_seq_rm_type {
 // note: clears the memory of the context
 common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx);
 
-// aborts execution on failure
-void common_context_seq_rm (llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1);
-void common_context_seq_add(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta);
-void common_context_seq_cp (llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1);
+struct common_memory {
+    llama_context * ctx_tgt = nullptr;
+    llama_context * ctx_dft = nullptr;
+
+    void init(llama_context * ctx_tgt, llama_context * ctx_dft = nullptr);
+
+    // aborts execution on failure
+    void seq_rm (llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
+    void seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const;
+    void seq_cp (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const;
+};
 
 //
 // Batch utils

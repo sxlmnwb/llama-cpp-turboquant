@@ -592,6 +592,7 @@ static void set_rows_sycl(ggml_backend_sycl_context & ctx, const ggml_tensor * s
         case GGML_TYPE_TURBO4_0:
             set_rows_sycl_turbo4<TIdx>(ctx, src0, src1, dst);
             break;
+
         default:
             GGML_ABORT("Unsupported tensor type!");
             break;

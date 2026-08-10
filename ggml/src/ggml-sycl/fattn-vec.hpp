@@ -89,6 +89,8 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
     constexpr int nthreads_KQ_q = (D/4 < warp_size ? D/4 : warp_size);
     constexpr int nthreads_V_q  = (D/4 < warp_size ? D/4 : warp_size);
 
+    constexpr int nthreads_KQ = type_K == GGML_TYPE_F16 ? 128 / cpy_nb : nthreads_KQ_q;
+    constexpr int nthreads_V  = type_V == GGML_TYPE_F16 ? 128 / cpy_nb : nthreads_V_q;
     constexpr bool K_is_turbo = (type_K == GGML_TYPE_TURBO2_0 || type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO4_0);
     constexpr bool V_is_turbo = (type_V == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO4_0);
     constexpr bool has_turbo = K_is_turbo || V_is_turbo;

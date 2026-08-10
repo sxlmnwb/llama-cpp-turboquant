@@ -347,13 +347,15 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
     static const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
     static const std::regex pattern_qkv_weight      ("blk\\.\\d*\\.attn_qkv.weight");
+    static const std::regex pattern_ds4_q_a_kv_weight ("blk\\.\\d*\\.attn_(q_a|kv)\\.weight");
+    static const std::regex pattern_ds4_q_b_weight    ("blk\\.\\d*\\.attn_q_b\\.weight");
     static const std::regex pattern_q_bias          ("blk\\.\\d*\\.attn_q\\.bias");
     static const std::regex pattern_kv_bias         ("blk\\.\\d*\\.attn_(k|v)\\.bias");
     static const std::regex pattern_qkv_bias        ("blk\\.\\d*\\.attn_qkv.bias");
     static const std::regex pattern_qk_norm         ("blk\\.\\d*\\.attn_(q|k)_norm\\.weight");
     static const std::regex pattern_kv_cache        ("cache_(k|v)_l\\d*");
     static const std::regex pattern_attn_sinks      ("blk\\.\\d*\\.attn_sinks.weight");
-    static const std::regex pattern_attn_out_weight ("blk\\.\\d*\\.attn_output.weight");
+    static const std::regex pattern_attn_out_weight ("blk\\.\\d*\\.attn_output(_[ab])?\\.weight");
     static const std::regex pattern_attn_out_bias   ("blk\\.\\d*\\.attn_output.bias");
     static const std::regex pattern_attn_gate_weight("blk\\.\\d*\\.attn_gate.weight");
 
@@ -441,6 +443,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         if (std::regex_match(tensor_name, pattern_qkv_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
         }
+        if (std::regex_match(tensor_name, pattern_ds4_q_a_kv_weight)) {
+            // DS4 q_a/kv are low-rank down-projections feeding per-row norms; column split would split the norm row, so mirror them
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+        if (std::regex_match(tensor_name, pattern_ds4_q_b_weight)) {
+            // DS4 q_b is the up-projection; pair it with the attn_output_a output tensor
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output_a.weight", "attn_output_b.weight");
+        }
         if ( std::regex_match(tensor_name, pattern_qkv_bias)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight", "ssm_out.weight");
         }
@@ -448,7 +458,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(tensor->ne[1] == 1 ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
         }
         if (std::regex_match(tensor_name, pattern_kv_cache) || std::regex_match(tensor_name, pattern_attn_sinks)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight", "attn_output_a.weight");
         }
         if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
@@ -811,6 +821,7 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_24B_A2B:       return "24B.A2B";
         case LLM_TYPE_26B_A4B:       return "26B.A4B";
         case LLM_TYPE_30B_A3B:       return "30B.A3B";
+        case LLM_TYPE_118B_A8B:      return "118B.A8B";
         case LLM_TYPE_31B_A3_5B:     return "31B.A3.5B";
         case LLM_TYPE_35B_A3B:       return "35B.A3B";
         case LLM_TYPE_48B_A3B:       return "48B.A3B";
@@ -840,6 +851,7 @@ static const char * llama_expert_gating_func_name(llama_expert_gating_func_type 
     switch (type) {
         case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX: return "softmax";
         case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID: return "sigmoid";
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT: return "softmax_weight";
         case LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS: return "sqrtsoftplus";
         default:                                    return "unknown";
     }
@@ -2083,7 +2095,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 res = nullptr;
             } break;
         case LLM_ARCH_DEEPSEEK32:
-        case LLM_ARCH_GLM_DSA:
             {
                 res = new llama_kv_cache_dsa(
                         *this,
@@ -2100,6 +2111,127 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         nullptr,
                         nullptr);
             } break;
+        case LLM_ARCH_GLM_DSA:
+            {
+                if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && hparams.n_layer_nextn > 0) {
+                    // The NextN/MTP draft head runs dense MLA (no DSA indexer), so the
+                    // MTP context uses a plain attention KV cache holding only the
+                    // nextn layer(s) - same pattern as the hybrid Qwen3.5 MTP context.
+                    llama_kv_cache::layer_filter_cb filter =
+                        [&](uint32_t il) { return il >= hparams.n_layer(); };
+
+                    res = new llama_kv_cache(
+                            *this,
+                            hparams,
+                            params.type_k,
+                            params.type_v,
+                            !cparams.flash_attn,
+                            cparams.offload_kqv,
+                            cparams.kv_unified,
+                            cparams.n_ctx_seq,
+                            cparams.n_seq_max,
+                            1,
+                            hparams.n_swa,
+                            hparams.swa_type,
+                            nullptr,
+                            filter,
+                            nullptr,
+                            nullptr);
+                } else {
+                    // Main context: DSA cache for the trunk layers only - the nextn
+                    // layer(s) are never attended by the trunk graph.
+                    llama_kv_cache::layer_filter_cb filter = nullptr;
+                    if (hparams.n_layer_nextn > 0) {
+                        filter = [&](uint32_t il) { return il < hparams.n_layer(); };
+                    }
+
+                    res = new llama_kv_cache_dsa(
+                            *this,
+                            params.type_k,
+                            params.type_v,
+                            !cparams.flash_attn,
+                            cparams.offload_kqv,
+                            cparams.kv_unified,
+                            cparams.n_ctx_seq,
+                            cparams.n_seq_max,
+                            1,
+                            hparams.n_swa,
+                            hparams.swa_type,
+                            filter,
+                            nullptr);
+                }
+            } break;
+        case LLM_ARCH_DEEPSEEK4:
+            {
+
+                GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
+
+                if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                    const llama_memory_i::layer_filter_cb filter_mtp = [&](int32_t il) {
+                        return il >= (int32_t) hparams.n_layer();
+                    };
+
+                    res = new llama_kv_cache_iswa(
+                            *this,
+                            params.type_k,
+                            params.type_v,
+                            !cparams.flash_attn,
+                            cparams.offload_kqv,
+                            params.swa_full,
+                            cparams.kv_unified,
+                            cparams.n_ctx_seq,
+                            cparams.n_seq_max,
+                            cparams.n_ubatch,
+                            1,
+                            nullptr,
+                            filter_mtp,
+                            nullptr,
+                            nullptr);
+                } else {
+                    res = new llama_kv_cache_dsv4(
+                            *this,
+                            params.type_k,
+                            params.type_v,
+                            !cparams.flash_attn,
+                            cparams.offload_kqv,
+                            params.swa_full,
+                            cparams.kv_unified,
+                            cparams.n_ctx_seq,
+                            cparams.n_seq_max,
+                            cparams.n_ubatch,
+                            1,
+                            cparams.n_rs_seq,
+                            nullptr,
+                            nullptr);
+                }
+            } break;
+        case LLM_ARCH_DFLASH:
+            {
+                // DSV4 DSpark stages store a single MLA-style K per position (window = the draft ring)
+                if (hparams.dsv4_hc_mult > 0) {
+                    GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
+
+                    res = new llama_kv_cache_iswa(
+                            *this,
+                            params.type_k,
+                            params.type_v,
+                            !cparams.flash_attn,
+                            cparams.offload_kqv,
+                            params.swa_full,
+                            cparams.kv_unified,
+                            cparams.n_ctx_seq,
+                            cparams.n_seq_max,
+                            cparams.n_ubatch,
+                            1,
+                            nullptr,
+                            nullptr,
+                            nullptr,
+                            nullptr);
+                    break;
+                }
+            }
+            [[fallthrough]];
+
         // Models that need standard caching should rely on recurrent/hybrid
         // checks
         default:
@@ -2205,7 +2337,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
                     }
 
-                    if ((arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_HY_V3) && hparams.n_layer_nextn > 0) {
+                    if ((arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_HY_V3 || arch == LLM_ARCH_GLM_DSA ||
+                            arch == LLM_ARCH_MIMO2) &&
+                            hparams.n_layer_nextn > 0) {
                         if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
                             filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
                         } else {
@@ -2213,24 +2347,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         }
                     }
 
-                    if (arch == LLM_ARCH_DEEPSEEK4) {
-                        GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
-
-                        res = new llama_kv_cache_dsv4(
-                                *this,
-                                params.type_k,
-                                params.type_v,
-                                !cparams.flash_attn,
-                                cparams.offload_kqv,
-                                params.swa_full,
-                                cparams.kv_unified,
-                                cparams.n_ctx_seq,
-                                cparams.n_seq_max,
-                                cparams.n_ubatch,
-                                1,
-                                filter,
-                                reuse);
-                    } else if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+                    if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         GGML_ASSERT(hparams.is_swa_any());
 
                         if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
@@ -2350,6 +2467,7 @@ llama_model_params llama_model_default_params() {
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
+        /*.load_mtp                    =*/ false,
     };
 
     return result;
@@ -2578,8 +2696,11 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_STEP35:
         case LLM_ARCH_TALKIE:
         case LLM_ARCH_MELLUM:
-        case LLM_ARCH_DFLASH:
             return LLAMA_ROPE_TYPE_NEOX;
+
+        case LLM_ARCH_DFLASH:
+            // DSV4 DSpark drafters use DeepSeek-V4's normal RoPE; legacy DFlash backbones are NeoX
+            return model->hparams.dsv4_hc_mult > 0 ? LLAMA_ROPE_TYPE_NORM : LLAMA_ROPE_TYPE_NEOX;
 
         case LLM_ARCH_QWEN2VL:
         case LLM_ARCH_PADDLEOCR:

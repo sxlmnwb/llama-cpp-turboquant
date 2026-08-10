@@ -430,11 +430,11 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_TURBO2_0 = 43, // TurboQuant 2-bit KV cache: WHT + 2-bit PolarQuant
-        GGML_TYPE_TURBO3_0 = 44, // TurboQuant 3-bit KV cache: WHT + 3-bit PolarQuant
-        GGML_TYPE_TURBO4_0 = 45, // TurboQuant 4-bit KV cache: WHT + 4-bit PolarQuant
-        GGML_TYPE_TQ3_1S  = 46, // TurboQuant 3-bit weight: WHT-rotated 8-level Lloyd-Max, block_size=32
-        GGML_TYPE_TQ4_1S  = 47, // TurboQuant 4-bit weight: WHT-rotated 16-level Lloyd-Max, block_size=32
+        GGML_TYPE_TURBO2_0 = 43, // TurboQuant 2-bit KV cache: WHT + 2-bit PolarQuant (runtime-only KV type)
+        GGML_TYPE_TURBO3_0 = 44, // TurboQuant 3-bit KV cache: WHT + 3-bit PolarQuant (runtime-only KV type)
+        GGML_TYPE_TQ3_1S  = 45, // TurboQuant 3-bit weight: WHT-rotated 8-level Lloyd-Max, block_size=32
+        GGML_TYPE_TQ4_1S  = 46, // TurboQuant 4-bit weight: WHT-rotated 16-level Lloyd-Max, block_size=32
+        GGML_TYPE_TURBO4_0 = 47, // TurboQuant 4-bit KV cache: WHT + 4-bit PolarQuant (runtime-only KV type)
         GGML_TYPE_COUNT   = 48,
     };
 
@@ -2599,17 +2599,7 @@ extern "C" {
             int                   group_size,    // 0 = auto (64 or 128 from ne[0])
             struct ggml_tensor  * scale);        // NULL = no InnerQ scaling
 
-    // DSA lightning indexer
-    //
-    // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]
-    // k:       [n_embd_idx, 1,          n_kv,    ne3 ]
-    // weights: [n_head_idx, n_batch,    1,       ne3 ] !! prescaled !!
-    // mask:    [n_kv,       n_batch,    1,       ne33] !! f16 !!
-    // res:     [n_kv,       n_batch,    1,       ne3 ]
-    //
-    // broadcast:
-    //   ne3 % ne33 == 0
-    //
+    // DeepSeek V4 Lightning Indexer
     GGML_API struct ggml_tensor * ggml_lightning_indexer(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
@@ -2618,8 +2608,6 @@ extern "C" {
         struct ggml_tensor  * mask);
 
     // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
-    // In short these operations are replacements for the original residual connection (x = transformer(x) + x)
-    // using a richer representation through streams.
     //
     // hc_comb: mixes [(2 + hc)*hc, n_tokens], scale [3], base [(2 + hc)*hc]
     //          -> [dst_hc, src_hc, n_tokens]
@@ -2643,11 +2631,9 @@ extern "C" {
             struct ggml_tensor  * x,
             struct ggml_tensor  * weights);
 
-    // hc_post: x [n_embd, n_tokens], residual [n_embd, hc, n_tokens],
-    //          post [hc, n_tokens], comb [dst_hc, src_hc, n_tokens]
+    // hc_post: x [n_embd, n_tokens], residual [n_embd, hc, n_tokens], post [hc, n_tokens], comb [dst_hc, src_hc, n_tokens]
     //          -> [n_embd, hc, n_tokens]
-    //   result[i, dst, t] = x[i, t]*post[dst, t]
-    //                       + sum_src residual[i, src, t]*comb[dst, src, t]
+    //   result[i, h, t] = x[i, t] * post[h, t] + sum_src residual[i, src, t] * comb[h, src, t]
     //
     GGML_API struct ggml_tensor * ggml_dsv4_hc_post(
             struct ggml_context * ctx,

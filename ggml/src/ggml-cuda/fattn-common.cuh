@@ -45,6 +45,46 @@ typedef void (* fattn_kernel_t)(
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
 
+struct ggml_cuda_flash_attn_ext_f16_extra_data {
+    uintptr_t K;
+    uintptr_t V;
+    uintptr_t end;
+};
+
+static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_get_f16_extra_data(
+        const ggml_tensor * dst, const bool need_f16_K, const bool need_f16_V) {
+    GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
+
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    GGML_ASSERT(K != nullptr);
+    GGML_ASSERT(V != nullptr);
+
+    const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
+
+    ggml_cuda_flash_attn_ext_f16_extra_data data = {};
+    data.end = (uintptr_t) dst->data + ggml_nbytes(dst);
+
+    if (need_f16_K && K->type != GGML_TYPE_F16) {
+        data.end = GGML_PAD(data.end, 128);
+        data.K   = data.end;
+        data.end += ggml_nelements(K)*ggml_type_size(GGML_TYPE_F16);
+    }
+
+    if (need_f16_V && V->type != GGML_TYPE_F16) {
+        if (V_is_K_view) {
+            data.V = data.K;
+        } else {
+            data.end = GGML_PAD(data.end, 128);
+            data.V   = data.end;
+            data.end += ggml_nelements(V)*ggml_type_size(GGML_TYPE_F16);
+        }
+    }
+
+    return data;
+}
+
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_f16(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds_v) {
@@ -1024,7 +1064,10 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
 template <int ncols1>
 __launch_bounds__(FATTN_KQ_STRIDE/2, 1)
 static __global__ void flash_attn_mask_to_KV_max(
-        const half2 * __restrict__ mask, int * __restrict__ KV_max, const int ne30, const int s31, const int s33) {
+        const half2 * mask_ptr, int * KV_max_ptr, const int ne30, const int64_t s31, const int64_t s33) {
+    const half2 * GGML_CUDA_RESTRICT mask   = mask_ptr;
+    int         * GGML_CUDA_RESTRICT KV_max = KV_max_ptr;
+
     const int ne31     = gridDim.x;
     const int tid      = threadIdx.x;
     const int sequence = blockIdx.y;
@@ -1462,15 +1505,14 @@ void launch_fattn(
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
     if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
-        const int s31 = mask->nb[1] / sizeof(half2);
-        const int s33 = mask->nb[3] / sizeof(half2);
+        const int64_t s31 = mask->nb[1] / sizeof(half2);
+        const int64_t s33 = mask->nb[3] / sizeof(half2);
 
         const dim3 blocks_num_KV_max(ntiles_x, Q->ne[3], 1);
         const dim3 block_dim_KV_max(FATTN_KQ_STRIDE/2, 1, 1);
 
         const int ne_KV_max = blocks_num_KV_max.x*blocks_num_KV_max.y;
         const int iter_k = K->ne[1] / FATTN_KQ_STRIDE;
-
         KV_max.alloc(ne_KV_max);
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
         ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,

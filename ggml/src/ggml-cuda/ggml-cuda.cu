@@ -119,131 +119,6 @@ static int ggml_cuda_get_physical_device(int device) {
 // probably because the Windows CUDA libraries forget to make this check before invoking the drivers
 // Forward declarations for host-staged cross-GPU copy helpers
 // (used by buffer ops before their definition site).
-static cudaError_t ggml_cuda_copy_across_devices(
-    void * dst, int dst_device, const void * src, int src_device,
-    size_t size, cudaStream_t dst_stream, cudaStream_t src_stream);
-static cudaError_t ggml_cuda_copy2d_across_devices(
-    void * dst, int dst_device, size_t dpitch,
-    const void * src, int src_device, size_t spitch,
-    size_t width, size_t height, cudaStream_t dst_stream, cudaStream_t src_stream);
-
-
-
-struct ggml_cuda_host_staging_pool {
-    void * buf = nullptr;
-    size_t size = 0;
-
-    cudaError_t ensure(size_t needed) {
-        if (needed <= size) {
-            return cudaSuccess;
-        }
-        if (buf) {
-            CUDA_CHECK(cudaFreeHost(buf));
-        }
-        cudaError_t err = cudaMallocHost(&buf, needed);
-        if (err != cudaSuccess) {
-            buf = nullptr;
-            size = 0;
-            return err;
-        }
-        size = needed;
-        return cudaSuccess;
-    }
-};
-
-static ggml_cuda_host_staging_pool & ggml_cuda_get_staging() {
-    static thread_local ggml_cuda_host_staging_pool pool;
-    return pool;
-}
-static cudaError_t ggml_cuda_copy_across_devices(
-    void * dst, int dst_device, const void * src, int src_device,
-    size_t size, cudaStream_t dst_stream, cudaStream_t src_stream) {
-
-    const auto & info = ggml_cuda_info();
-    if (info.peer_access[src_device][dst_device]) {
-        return cudaMemcpyPeerAsync(dst, dst_device, src, src_device, size, dst_stream);
-    }
-
-    // Fallback: stage through pinned host memory via reusable pool
-    int prev_device = ggml_cuda_get_device();
-    auto & pool = ggml_cuda_get_staging();
-    cudaError_t err = pool.ensure(size);
-    if (err != cudaSuccess) { return err; }
-
-    ggml_cuda_set_device(src_device);
-    err = cudaMemcpyAsync(pool.buf, src, size, cudaMemcpyDeviceToHost, src_stream);
-    if (err != cudaSuccess) { goto cleanup; }
-
-    err = cudaStreamSynchronize(src_stream);
-    if (err != cudaSuccess) { goto cleanup; }
-
-    ggml_cuda_set_device(dst_device);
-    err = cudaMemcpyAsync(dst, pool.buf, size, cudaMemcpyHostToDevice, dst_stream);
-
-cleanup:
-    ggml_cuda_set_device(prev_device);
-    return err;
-}
-
-// 2D host-staged cross-device copy for strided data (used in split mul_mat output).
-// Batches all rows into a single contiguous staging buffer to replace the
-// original row-by-row approach (one sync per row -> two syncs total).
-static cudaError_t ggml_cuda_copy2d_across_devices(
-    void * dst, int dst_device, size_t dpitch,
-    const void * src, int src_device, size_t spitch,
-    size_t width, size_t height, cudaStream_t dst_stream, cudaStream_t src_stream) {
-
-    const auto & info = ggml_cuda_info();
-    if (info.peer_access[src_device][dst_device]) {
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-        cudaMemcpy3DPeerParms p = {};
-        p.dstDevice = dst_device;
-        p.dstPtr = make_cudaPitchedPtr(dst, dpitch, dpitch, height);
-        p.srcDevice = src_device;
-        p.srcPtr = make_cudaPitchedPtr(const_cast<void *>(src), spitch, spitch, height);
-        p.extent = make_cudaExtent(width, height, 1);
-        return cudaMemcpy3DPeerAsync(&p, dst_stream);
-#else
-        // HIP/MUSA do not provide cudaMemcpy3DPeerAsync; with peer access
-        // enabled a plain device-to-device 2D copy works across devices
-        // (same approach as ggml_cuda_Memcpy2DPeerAsync above).
-        return cudaMemcpy2DAsync(dst, dpitch, src, spitch, width, height, cudaMemcpyDeviceToDevice, dst_stream);
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    }
-
-    // Fallback: stage all rows through a single contiguous pinned buffer
-    int prev_device = ggml_cuda_get_device();
-    auto & pool = ggml_cuda_get_staging();
-    cudaError_t err = pool.ensure(width * height);
-    if (err != cudaSuccess) { return err; }
-
-    // Batch D2H for all rows
-    ggml_cuda_set_device(src_device);
-    for (size_t r = 0; r < height; r++) {
-        err = cudaMemcpyAsync(
-            (char *)pool.buf + r * width,
-            (const char *)src + r * spitch,
-            width, cudaMemcpyDeviceToHost, src_stream);
-        if (err != cudaSuccess) { goto cleanup; }
-    }
-    err = cudaStreamSynchronize(src_stream);
-    if (err != cudaSuccess) { goto cleanup; }
-
-    // Batch H2D for all rows
-    ggml_cuda_set_device(dst_device);
-    for (size_t r = 0; r < height; r++) {
-        err = cudaMemcpyAsync(
-            (char *)dst + r * dpitch,
-            (char *)pool.buf + r * width,
-            width, cudaMemcpyHostToDevice, dst_stream);
-        if (err != cudaSuccess) { goto cleanup; }
-    }
-    err = cudaStreamSynchronize(dst_stream);
-
-cleanup:
-    ggml_cuda_set_device(prev_device);
-    return err;
-}
 void ggml_cuda_set_device(int device) {
     // translate the (possibly virtual) device id to the physical CUDA device that backs it
     const int physical_device = ggml_cuda_get_physical_device(device);
@@ -1503,6 +1378,12 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
 
 /// kernels
 
+typedef void (*ggml_cuda_op_mul_mat_t)(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
+    const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
+    const int64_t src1_padded_row_size, cudaStream_t stream);
+
 static __global__ void k_compute_batched_ptrs(
         const void * src0_as_f16, const void * src1_as_f16, char * dst,
         const void ** ptrs_src, void ** ptrs_dst,
@@ -1995,15 +1876,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // Therefore, in such cases use cuBLAS.
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
         && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
-
-
-    // TQ weight types use fused dp4a path (all batch sizes), not mmvq/mmq
-    const bool is_tq_weight = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
-
-    const bool bad_padding_or_type = bad_padding_clear
-        || (src1->type != GGML_TYPE_F32 && !is_tq_weight)
-        || (dst->type  != GGML_TYPE_F32 && !is_tq_weight);
-    if (bad_padding_or_type) {
+    if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
         return;
     }
@@ -2011,26 +1884,35 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
-    // fused TQ weight mul_mat via warp shuffle WHT
-    if (is_tq_weight && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE) {
-        ggml_cuda_mul_mat_tq(ctx, src0, src1, dst);
-        return;
-    }
-    // large prefill: runtime TQ4_1S -> q8_0 scratch conversion + cuBLAS
-    if (is_tq_weight && src0->type == GGML_TYPE_TQ4_1S) {
-        ggml_cuda_mul_mat_tq4_1s_cublas(ctx, src0, src1, dst);
-        return;
-    }
-
     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
+        // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
+        // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    // A transposed vector can still use MMVQ (i.e. ne01 == 1)
+    if (ne01 == 1 && ne11 > MMVF_MAX_BATCH_SIZE && ne2 == 1 && ne3 == 1
+            && src0->type == GGML_TYPE_F32
+            && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)
+            && ggml_cuda_should_use_mmvf(src1->type, cc, src1->ne, src1->nb, /*ne11 =*/ 1)) {
+        ggml_tensor dst_vec = *dst;
+        dst_vec.ne[0] = ne11;
+        dst_vec.ne[1] = 1;
+        dst_vec.nb[1] = dst_vec.nb[0]*ne11;
+        dst_vec.nb[2] = dst_vec.nb[1];
+        dst_vec.nb[3] = dst_vec.nb[1];
+        ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, &dst_vec);
         return;
     }
     if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
-    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
+
+    // TQ weight types use the fused dp4a path (decode) or runtime q8_0 conversion + cuBLAS (prefill),
+    // never mmvq/mmq (mmvq's type switch has no TQ cases and aborts).
+    const bool is_tq_weight = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
+    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11) && !is_tq_weight) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
     }
@@ -2038,8 +1920,54 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
     }
+    // TQ weight types: fused dp4a path (decode) or runtime q8_0 conversion + cuBLAS (prefill).
+    // Note: upstream removed the fork's `!split` guard, so TQ weights on multi-GPU split layouts
+    // are routed to the fused kernel like any other batch (the split layout is not specially handled).
+    //
+    // The fused TQ kernels index src1/dst as flat contiguous buffers (no nb[] stride handling in
+    // mmvq-tq.cu), so permuted/viewed activations (e.g. DeepSeek-V4 MLA projections) must take the
+    // stride-aware cuBLAS fallback below, which dequantizes TQ via ggml_get_to_fp16_cuda.
+    const bool tq_fast_path_ok = ggml_is_contiguous(src1) && ggml_is_contiguous(dst);
+
+    // GGML_TYPE_TQ3_1S: the fused warp-scalar kernel (mul_mat_tq3_1s_multi /
+    // tq_prerotate_activation in mmvq-tq.cu) is disabled here pending a fix.
+    // Root-caused via eval-callback node-diffing on DeepSeek-V4-Flash (real
+    // TQ3_1S attn/ffn weights, CUDA vs CPU-oracle): output for some MUL_MAT
+    // nodes (e.g. blk.N.attn_q_a, a 4096->1024 low-rank bottleneck) diverges
+    // ~2%/layer, compounding over 61 layers into incoherent generation on
+    // CUDA (coherent on CPU/Metal). The math of the fused kernel (per-block
+    // WHT rotation + centroid dot product) was verified bit-for-bit
+    // equivalent to the (known-correct) dequantize_tq3_1s inverse-WHT used
+    // by the cuBLAS fallback, and switching the pre-rotated activation
+    // buffer from half to float (removing one candidate precision loss)
+    // made no measurable difference — so this is very likely a reduction-
+    // order/cancellation sensitivity in the kernel's per-lane accumulation
+    // for real (non-synthetic) weight/activation distributions rather than
+    // a simple indexing bug: test-backend-ops MUL_MAT cases at the exact
+    // failing shape (tq3_1s, m=1024, n=8, k=4096) pass with random data.
+    // Disabling *only* TQ3_1S here (confirmed via a direct A/B on the CUDA0
+    // repro: forcing all TQ mul_mats through cuBLAS restores coherent
+    // output) routes it to the verified-correct dequant+cuBLAS path below.
+    // TQ4_1S (dp4a and the AMD scalar variant) is untouched — no model on
+    // hand uses it and there's no evidence it shares this bug, so the fast
+    // path stays enabled for that type to avoid regressing existing users.
+    const bool tq3_1s_fused_disabled = (src0->type == GGML_TYPE_TQ3_1S);
+
+    if (is_tq_weight && tq_fast_path_ok && !tq3_1s_fused_disabled && ne11 <= MMVQ_MAX_BATCH_SIZE) {
+        // Fused TQ weight mul_mat with pre-rotated activations via warp shuffle WHT
+        // Handles ne[1]=1 (decode) and ne[1]≤8 (multi-token / speculative decoding)
+        ggml_cuda_mul_mat_tq(ctx, src0, src1, dst);
+        return;
+    }
+    if (is_tq_weight && tq_fast_path_ok && src0->type == GGML_TYPE_TQ4_1S) {
+        // Large prefill: runtime TQ4_1S -> q8_0 scratch conversion + cuBLAS
+        ggml_cuda_mul_mat_tq4_1s_cublas(ctx, src0, src1, dst);
+        return;
+    }
+
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
 }
+
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -4999,6 +4927,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:
                     case GGML_TYPE_Q1_0:
+                    case GGML_TYPE_Q2_0:
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q5_0:
@@ -5039,13 +4968,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_BF16:
                     case GGML_TYPE_I32:
                     case GGML_TYPE_Q1_0:
+                    case GGML_TYPE_Q2_0:
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
-                    case GGML_TYPE_TQ4_1S:
-                    case GGML_TYPE_TQ3_1S:
                     case GGML_TYPE_Q2_K:
                     case GGML_TYPE_Q3_K:
                     case GGML_TYPE_Q4_K:
@@ -5059,6 +4987,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ1_S:
                     case GGML_TYPE_IQ1_M:
                     case GGML_TYPE_IQ4_XS:
+                    case GGML_TYPE_TQ4_1S:
+                    case GGML_TYPE_TQ3_1S:
                         return true;
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_MXFP4:
@@ -5302,7 +5232,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_IM2COL:
         case GGML_OP_IM2COL_3D:
         case GGML_OP_CONV_2D:
-            return true;
+            return (ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]));
         case GGML_OP_CONV_2D_DW:
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_CONV_TRANSPOSE_2D:

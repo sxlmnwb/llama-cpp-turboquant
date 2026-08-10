@@ -123,6 +123,7 @@ enum llm_type {
     LLM_TYPE_24B_A2B, // lfm2moe
     LLM_TYPE_26B_A4B, // Gemma4
     LLM_TYPE_30B_A3B,
+    LLM_TYPE_118B_A8B,
     LLM_TYPE_31B_A3_5B,
     LLM_TYPE_35B_A3B, // Qwen3.5
     LLM_TYPE_48B_A3B, // Kimi Linear
@@ -267,7 +268,6 @@ struct llama_layer {
     struct ggml_tensor * bk   = nullptr;
     struct ggml_tensor * bv   = nullptr;
     struct ggml_tensor * bo   = nullptr;
-
     struct ggml_tensor * wq_cross  = nullptr;
     struct ggml_tensor * wk_cross  = nullptr;
     struct ggml_tensor * wv_cross  = nullptr;
@@ -532,6 +532,8 @@ struct llama_layer {
     struct ggml_tensor * out_scale = nullptr;
     // EAGLE3 hidden norm (per-layer)
     struct ggml_tensor * eagle3_hidden_norm = nullptr;
+
+
 
 
     struct llama_layer_posnet posnet;

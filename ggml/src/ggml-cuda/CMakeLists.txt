@@ -121,6 +121,10 @@ if (CUDAToolkit_FOUND)
             template-instances/fattn-vec-instance-f16-f16.cu
             template-instances/fattn-vec-instance-q4_0-q4_0.cu
             template-instances/fattn-vec-instance-q8_0-q8_0.cu
+            template-instances/fattn-vec-instance-f16-q8_0.cu
+            template-instances/fattn-vec-instance-q8_0-f16.cu
+            template-instances/fattn-vec-instance-bf16-q8_0.cu
+            template-instances/fattn-vec-instance-q8_0-bf16.cu
             template-instances/fattn-vec-instance-bf16-bf16.cu
             template-instances/fattn-vec-instance-turbo3_0-turbo3_0.cu
             template-instances/fattn-vec-instance-turbo3_0-q8_0.cu
@@ -288,12 +292,4 @@ if (CUDAToolkit_FOUND)
     target_compile_options(ggml-cuda PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${CUDA_FLAGS}>")
 else()
     message(FATAL_ERROR "CUDA Toolkit not found")
-endif()
-
-# Suppress upstream warnings from GGML_ABORT host-side compilation
-if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-    target_compile_options(ggml-cuda PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wno-missing-noreturn,-Wno-unreachable-code-break,-Wno-unused-command-line-argument,-Wno-tautological-compare>
-        $<$<COMPILE_LANGUAGE:CUDA>:-diag-suppress=177>
-    )
 endif()

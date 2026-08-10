@@ -1248,6 +1248,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     }
 }
 
+
 template<>
 void set_rows_cuda<half, int32_t>(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const half    * src0_d = (const half *)src0->data;
@@ -1256,7 +1257,6 @@ void set_rows_cuda<half, int32_t>(ggml_backend_cuda_context & ctx, const ggml_te
     GGML_TENSOR_BINARY_OP_LOCALS
 
     cudaStream_t stream = ctx.stream();
-
 
     if (dst->type == GGML_TYPE_F16) {
         set_rows_cuda(

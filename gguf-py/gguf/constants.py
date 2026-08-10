@@ -162,6 +162,7 @@ class Keys:
         BLOCK_SIZE                        = "{arch}.block_size"
         NORM_BEFORE_RESIDUAL              = "{arch}.norm_before_residual"
         NORM_BEFORE_FC                    = "{arch}.norm_before_fc"
+        DECODER_ARCH                      = "{arch}.decoder_arch"
 
     class Attention:
         HEAD_COUNT                   = "{arch}.attention.head_count"
@@ -187,9 +188,9 @@ class Keys:
         OUTPUT_GROUP_COUNT           = "{arch}.attention.output_group_count"
         OUTPUT_LORA_RANK             = "{arch}.attention.output_lora_rank"
         OUTPUT_SCALE                 = "{arch}.attention.output_scale"
-        VALUE_SCALE                  = "{arch}.attention.value_scale"
         COMPRESS_RATIOS              = "{arch}.attention.compress_ratios"
         COMPRESS_ROPE_FREQ_BASE      = "{arch}.attention.compress_rope_freq_base"
+        VALUE_SCALE                  = "{arch}.attention.value_scale"
         TEMPERATURE_LENGTH           = "{arch}.attention.temperature_length"
         KEY_LENGTH_MLA               = "{arch}.attention.key_length_mla"
         VALUE_LENGTH_MLA             = "{arch}.attention.value_length_mla"
@@ -353,6 +354,7 @@ class Keys:
         class Attention:
             HEAD_COUNT      = "clip.vision.attention.head_count"
             HEAD_COUNT_KV   = "clip.vision.attention.head_count_kv" # used by mimovl (GQA)
+            HEAD_DIM        = "clip.vision.attention.head_dim" # set when qkv width != n_embd
             LAYERNORM_EPS   = "clip.vision.attention.layer_norm_epsilon"
 
         class Projector:
@@ -373,6 +375,7 @@ class Keys:
         FEED_FORWARD_LENGTH = "clip.audio.feed_forward_length"
         PROJECTION_DIM      = "clip.audio.projection_dim"
         BLOCK_COUNT         = "clip.audio.block_count"
+        SUBSAMPLING_FACTOR  = "clip.audio.subsampling_factor"
         CHUNK_SIZE          = "clip.audio.chunk_size"
         CONV_KERNEL_SIZE    = "clip.audio.conv_kernel_size"
         MAX_POS_EMB         = "clip.audio.max_pos_emb"
@@ -756,6 +759,7 @@ class MODEL_TENSOR(IntEnum):
     ENC_FFN_DOWN         = auto()
     ENC_FFN_UP           = auto()
     ENC_OUTPUT_NORM      = auto()
+    ENC_AUX_NORM         = auto()
     CLS                  = auto() # classifier
     CLS_OUT              = auto() # classifier output projection
     CLS_NORM             = auto()
@@ -1002,6 +1006,10 @@ class MODEL_TENSOR(IntEnum):
     A_ENC_CONV_NORM        = auto() # SSM conv
     A_ENC_CONV_PW1         = auto()
     A_ENC_CONV_PW2         = auto()
+    A_ENC_CONV_NORM_MEAN   = auto() # parakeet
+    A_ENC_CONV_NORM_VAR    = auto() # parakeet
+    A_ENC_MEL_FILTERS      = auto() # parakeet
+    A_ENC_WINDOW           = auto() # parakeet
     A_CTC_OUT              = auto()
     A_CTC_OUT_MID          = auto()
     A_ENC_ATTN_REL_POS_EMB = auto()
@@ -1098,9 +1106,9 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.DEEPSEEK:         "deepseek",
     MODEL_ARCH.DEEPSEEK2:        "deepseek2",
     MODEL_ARCH.DEEPSEEK2OCR:     "deepseek2-ocr",
-    MODEL_ARCH.DEEPSEEK32:       "deepseek32",
     MODEL_ARCH.DEEPSEEK4:        "deepseek4",
     MODEL_ARCH.CHATGLM:          "chatglm",
+    MODEL_ARCH.DEEPSEEK4:        "deepseek4",
     MODEL_ARCH.GLM4:             "glm4",
     MODEL_ARCH.GLM4_MOE:         "glm4moe",
     MODEL_ARCH.GLM_DSA:          "glm-dsa",
@@ -1184,6 +1192,9 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.MASKED_EMBD_CENTROIDS:     "masked_embd_centroids",
     MODEL_TENSOR.MASKED_EMBD_ORDERING:      "masked_embd_ordering",
     MODEL_TENSOR.POS_EMBD:                  "position_embd",
+    MODEL_TENSOR.HC_HEAD_FN:                "output_hc_fn",
+    MODEL_TENSOR.HC_HEAD_BASE:              "output_hc_base",
+    MODEL_TENSOR.HC_HEAD_SCALE:             "output_hc_scale",
     MODEL_TENSOR.OUTPUT_NORM:               "output_norm",
     MODEL_TENSOR.OUTPUT:                    "output",
     MODEL_TENSOR.DENSE_2_OUT:               "dense_2", # embeddinggemma 2_Dense
@@ -1231,8 +1242,8 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.FFN_DOWN_EXP:              "blk.{bid}.ffn_down_exps",
     MODEL_TENSOR.FFN_UP_EXP:                "blk.{bid}.ffn_up_exps",
     MODEL_TENSOR.FFN_GATE_UP_EXP:           "blk.{bid}.ffn_gate_up_exps",
-    MODEL_TENSOR.FFN_EXP_PROBS_B:           "blk.{bid}.exp_probs_b",
     MODEL_TENSOR.FFN_GATE_TID2EID:          "blk.{bid}.ffn_gate_tid2eid",
+    MODEL_TENSOR.FFN_EXP_PROBS_B:           "blk.{bid}.exp_probs_b",
     MODEL_TENSOR.MOE_LATENT_DOWN:           "blk.{bid}.ffn_latent_down",      # nemotron 3 super
     MODEL_TENSOR.MOE_LATENT_UP:             "blk.{bid}.ffn_latent_up",        # nemotron 3 super
     MODEL_TENSOR.LAYER_OUT_NORM:            "blk.{bid}.layer_output_norm",
@@ -1362,6 +1373,7 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.ENC_FFN_DOWN:              "enc.blk.{bid}.ffn_down",
     MODEL_TENSOR.ENC_FFN_UP:                "enc.blk.{bid}.ffn_up",
     MODEL_TENSOR.ENC_OUTPUT_NORM:           "enc.output_norm",
+    MODEL_TENSOR.ENC_AUX_NORM:              "enc.aux_norm",
     MODEL_TENSOR.CLS:                       "cls",
     MODEL_TENSOR.CLS_OUT:                   "cls.output",
     MODEL_TENSOR.CLS_NORM:                  "cls.norm",
@@ -1591,6 +1603,10 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.A_ENC_CONV_NORM:           "a.blk.{bid}.conv_norm",
     MODEL_TENSOR.A_ENC_CONV_PW1:            "a.blk.{bid}.conv_pw1",
     MODEL_TENSOR.A_ENC_CONV_PW2:            "a.blk.{bid}.conv_pw2",
+    MODEL_TENSOR.A_ENC_CONV_NORM_MEAN:      "a.blk.{bid}.conv_norm_mean",
+    MODEL_TENSOR.A_ENC_CONV_NORM_VAR:       "a.blk.{bid}.conv_norm_var",
+    MODEL_TENSOR.A_ENC_MEL_FILTERS:         "a.mel_filters",
+    MODEL_TENSOR.A_ENC_WINDOW:              "a.window",
     MODEL_TENSOR.A_CTC_OUT:                 "a.enc_ctc_out",
     MODEL_TENSOR.A_CTC_OUT_MID:             "a.enc_ctc_out_mid",
     MODEL_TENSOR.A_ENC_ATTN_REL_POS_EMB:    "a.blk.{bid}.attn_rel_pos_emb",
@@ -1810,6 +1826,10 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.A_ENC_CONV_NORM,
         MODEL_TENSOR.A_ENC_CONV_PW1,
         MODEL_TENSOR.A_ENC_CONV_PW2,
+        MODEL_TENSOR.A_ENC_CONV_NORM_MEAN,
+        MODEL_TENSOR.A_ENC_CONV_NORM_VAR,
+        MODEL_TENSOR.A_ENC_MEL_FILTERS,
+        MODEL_TENSOR.A_ENC_WINDOW,
         MODEL_TENSOR.A_MM_INP_PROJ,
         MODEL_TENSOR.A_MM_SOFT_EMB_NORM,
         MODEL_TENSOR.A_MM_EMBEDDING,
@@ -3317,6 +3337,12 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_GATE_SHEXP,
         MODEL_TENSOR.FFN_DOWN_SHEXP,
         MODEL_TENSOR.FFN_UP_SHEXP,
+        MODEL_TENSOR.NEXTN_EH_PROJ,
+        MODEL_TENSOR.NEXTN_EMBED_TOKENS,
+        MODEL_TENSOR.NEXTN_ENORM,
+        MODEL_TENSOR.NEXTN_HNORM,
+        MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD,
+        MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM,
     ],
     MODEL_ARCH.ERNIE4_5_MOE: [
         MODEL_TENSOR.TOKEN_EMBD,
@@ -4363,16 +4389,45 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.ATTN_OUT,
         MODEL_TENSOR.ATTN_Q_NORM,
         MODEL_TENSOR.ATTN_K_NORM,
+        MODEL_TENSOR.ATTN_GATE,
+
+        MODEL_TENSOR.ATTN_SINKS,
+        MODEL_TENSOR.ATTN_Q_A,
+        MODEL_TENSOR.ATTN_Q_B,
+        MODEL_TENSOR.ATTN_Q_A_NORM,
+        MODEL_TENSOR.ATTN_KV,
+        MODEL_TENSOR.ATTN_KV_NORM,
+        MODEL_TENSOR.ATTN_OUT_A,
+        MODEL_TENSOR.ATTN_OUT_B,
+        MODEL_TENSOR.HC_ATTN_FN,
+        MODEL_TENSOR.HC_ATTN_BASE,
+        MODEL_TENSOR.HC_ATTN_SCALE,
+        MODEL_TENSOR.HC_FFN_FN,
+        MODEL_TENSOR.HC_FFN_BASE,
+        MODEL_TENSOR.HC_FFN_SCALE,
+        MODEL_TENSOR.HC_HEAD_FN,
+        MODEL_TENSOR.HC_HEAD_BASE,
+        MODEL_TENSOR.HC_HEAD_SCALE,
+
         MODEL_TENSOR.FFN_NORM,
         MODEL_TENSOR.FFN_GATE,
         MODEL_TENSOR.FFN_DOWN,
         MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_EXP_PROBS_B,
+        MODEL_TENSOR.FFN_GATE_EXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.FFN_UP_EXP,
+        MODEL_TENSOR.FFN_GATE_SHEXP,
+        MODEL_TENSOR.FFN_DOWN_SHEXP,
+        MODEL_TENSOR.FFN_UP_SHEXP,
         MODEL_TENSOR.FC,
         MODEL_TENSOR.ENC_OUTPUT_NORM,
         # optional DSpark heads
         MODEL_TENSOR.DSPARK_MARKOV_W1,
         MODEL_TENSOR.DSPARK_MARKOV_W2,
         MODEL_TENSOR.DSPARK_CONF_PROJ,
+        MODEL_TENSOR.ENC_AUX_NORM,
     ],
     MODEL_ARCH.MISTRAL4: [
         MODEL_TENSOR.TOKEN_EMBD,
@@ -4427,8 +4482,11 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_EXP_PROBS_B,
         MODEL_TENSOR.LAYER_OUT_NORM,
         MODEL_TENSOR.NEXTN_EH_PROJ,
+        MODEL_TENSOR.NEXTN_EMBED_TOKENS,
         MODEL_TENSOR.NEXTN_ENORM,
         MODEL_TENSOR.NEXTN_HNORM,
+        MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD,
+        MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM,
     ],
     MODEL_ARCH.STEP35: [
         MODEL_TENSOR.TOKEN_EMBD,
@@ -4723,17 +4781,15 @@ class GGMLQuantizationType(IntEnum):
     NVFP4   = 40
     Q1_0    = 41
     Q2_0    = 42
-    TURBO2_0 = 43
-    TURBO3_0 = 44
-    TURBO4_0 = 45
-    TQ3_1S  = 46
-    TQ4_1S  = 47
+    TQ3_1S  = 45
+    TQ4_1S  = 46
 
 
 class ExpertGatingFuncType(IntEnum):
-    SOFTMAX       = 1
-    SIGMOID       = 2
-    SQRTSOFTPLUS  = 4
+    SOFTMAX        = 1
+    SIGMOID        = 2
+    SOFTMAX_WEIGHT = 3
+    SQRTSOFTPLUS   = 4
 
 
 # TODO: add GGMLFileType from ggml_ftype in ggml.h
@@ -4786,6 +4842,7 @@ class LlamaFileType(IntEnum):
     MOSTLY_Q2_0          = 41  # except 1d tensors
     MOSTLY_TQ3_1S        = 43  # except 1d tensors
     MOSTLY_TQ4_1S        = 44  # except 1d tensors
+
 
     GUESSED              = 1024  # not specified in the model file
 
@@ -4868,6 +4925,7 @@ class VisionProjectorType:
     YOUTUVL = "youtuvl"
     NEMOTRON_V2_VL = "nemotron_v2_vl"
     HUNYUANVL      = "hunyuanvl"
+    PARAKEET       = "parakeet"  # audio
     MINIMAXM3      = "minimax_m3"
     MINICPMV4_6    = "minicpmv4_6"
     GRANITE_SPEECH = "granite_speech"  # audio
